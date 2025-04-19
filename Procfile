@@ -1,0 +1,1 @@
+worker: python economy_bot.py 
