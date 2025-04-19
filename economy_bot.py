@@ -7,6 +7,10 @@ import json
 import aiohttp
 import random
 import string
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
 # Получаем токен напрямую из переменной окружения
 TOKEN = os.getenv("TOKEN")
@@ -240,5 +244,12 @@ async def on_application_command_error(interaction, error):
     print(f"Ошибка при выполнении команды: {error}")
     await interaction.response.send_message(f"Произошла ошибка: {error}", ephemeral=True)
 
+# Проверка наличия токена
+if not TOKEN:
+    print("ОШИБКА: Токен бота не указан в переменных окружения!")
+    print("Добавьте переменную TOKEN в .env файл или в настройки платформы")
+    exit(1)
+
 # Start the bot
-client.run(TOKEN) 
+if __name__ == "__main__":
+    client.run(TOKEN) 
