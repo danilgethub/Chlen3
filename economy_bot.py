@@ -19,7 +19,9 @@ TOKEN = os.getenv("TOKEN")
 API_KEY = os.getenv("API_KEY", "YOUR_SECRET_API_KEY_CHANGE_THIS")
 
 # Настройки API
-API_BASE_URL = "http://localhost:8080/api"  # Измените на IP вашего сервера Minecraft
+API_HOST = os.getenv("API_HOST", "localhost")  # IP адрес сервера Minecraft
+API_PORT = os.getenv("API_PORT", "8080")  # Порт API на сервере Minecraft
+API_BASE_URL = f"http://{API_HOST}:{API_PORT}/api"
 HEADERS = {
     "Content-Type": "application/json",
     "X-API-Key": API_KEY
@@ -37,25 +39,59 @@ tree = app_commands.CommandTree(client)
 # Словарь для хранения кодов верификации
 verification_codes = {}
 
+# Временный словарь для эмуляции API, когда настоящий API недоступен
+mock_data = {
+    "balances": {},
+    "discord_links": {}
+}
+
+# Функция для проверки доступности API
+async def is_api_available():
+    url = f"{API_BASE_URL}/balance"  # Просто используем любой эндпоинт для проверки
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=HEADERS, timeout=2) as response:
+                return response.status < 500  # Считаем API доступным, если не получаем ошибку сервера
+    except:
+        return False
+
 # Асинхронная функция для отправки запросов к API плагина
 async def send_api_request(endpoint, data):
     url = f"{API_BASE_URL}/{endpoint}"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(url, json=data, headers=HEADERS) as response:
-                if response.status == 200:
-                    return await response.json()
+    try:
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(url, json=data, headers=HEADERS, timeout=5) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        try:
+                            error_json = json.loads(error_text)
+                            return {"error": error_json.get("error", "Неизвестная ошибка")}
+                        except:
+                            return {"error": f"HTTP ошибка {response.status}: {error_text}"}
+            except aiohttp.ClientError as e:
+                # Если API недоступен, используем эмуляцию
+                if endpoint == "balance":
+                    discord_id = data.get("discord_id")
+                    if discord_id in mock_data["discord_links"]:
+                        player_id = mock_data["discord_links"][discord_id]
+                        balance = mock_data["balances"].get(player_id, 0)
+                        return {"balance": balance, "warning": "API Minecraft недоступен. Используются временные данные."}
+                    else:
+                        return {"error": "API Minecraft сейчас недоступен. Ваш аккаунт Discord не привязан к Minecraft."}
+                elif endpoint == "link":
+                    discord_id = data.get("discord_id")
+                    code = "".join(random.choices(string.digits, k=6))
+                    verification_codes[code] = discord_id
+                    return {"verification_code": code, "warning": "API Minecraft недоступен. Код не будет работать в игре."}
+                elif endpoint == "top":
+                    return {"players": [], "warning": "API Minecraft недоступен. Топ игроков временно недоступен."}
                 else:
-                    error_text = await response.text()
-                    try:
-                        error_json = json.loads(error_text)
-                        return {"error": error_json.get("error", "Неизвестная ошибка")}
-                    except:
-                        return {"error": f"HTTP ошибка {response.status}: {error_text}"}
-        except aiohttp.ClientError as e:
-            return {"error": f"Ошибка соединения: {str(e)}"}
-        except Exception as e:
-            return {"error": f"Непредвиденная ошибка: {str(e)}"}
+                    return {"error": f"API Minecraft сейчас недоступен: {str(e)}"}
+    except Exception as e:
+        return {"error": f"Непредвиденная ошибка: {str(e)}"}
 
 # Класс модального окна для перевода денег
 class TransferModal(Modal, title="Перевод монет"):
@@ -107,12 +143,13 @@ class TransferModal(Modal, title="Перевод монет"):
             await interaction.followup.send(f"Ошибка: {response['error']}", ephemeral=True)
         else:
             new_balance = response.get("new_balance", 0)
-            await interaction.followup.send(
-                f"Перевод выполнен успешно!\n"
-                f"Вы перевели {amount_value} монет игроку {self.receiver.value}.\n"
-                f"Ваш новый баланс: {new_balance} монет.", 
-                ephemeral=True
-            )
+            message = f"Перевод выполнен успешно!\nВы перевели {amount_value} монет игроку {self.receiver.value}.\nВаш новый баланс: {new_balance} монет."
+            
+            # Если есть предупреждение, добавляем его
+            if "warning" in response:
+                message += f"\n\n⚠️ {response['warning']}"
+            
+            await interaction.followup.send(message, ephemeral=True)
 
 # Команда для проверки баланса
 @tree.command(name="balance", description="Проверить свой баланс")
@@ -143,6 +180,11 @@ async def balance_command(interaction: discord.Interaction):
             description=f"У вас на счету: **{balance} монет**",
             color=discord.Color.gold()
         )
+        
+        # Если есть предупреждение, добавляем его
+        if "warning" in response:
+            embed.add_field(name="⚠️ Предупреждение", value=response["warning"], inline=False)
+        
         embed.set_footer(text="Экономическая система Minecraft-Discord")
         
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -178,15 +220,22 @@ async def link_command(interaction: discord.Interaction):
         await interaction.followup.send("Не удалось получить код верификации. Попробуйте позже.", ephemeral=True)
         return
     
+    # Создаем сообщение
+    description = (
+        f"Ваш код верификации: **{verification_code}**\n\n"
+        f"Войдите на сервер Minecraft и введите команду:\n"
+        f"```/setdiscord {verification_code}```\n"
+        f"Код действителен в течение 5 минут."
+    )
+    
+    # Если есть предупреждение, добавляем его
+    if "warning" in response:
+        description += f"\n\n⚠️ {response['warning']}"
+    
     # Отправляем код пользователю
     embed = discord.Embed(
         title="Привязка аккаунта Minecraft",
-        description=(
-            f"Ваш код верификации: **{verification_code}**\n\n"
-            f"Войдите на сервер Minecraft и введите команду:\n"
-            f"```/setdiscord {verification_code}```\n"
-            f"Код действителен в течение 5 минут."
-        ),
+        description=description,
         color=discord.Color.blue()
     )
     
@@ -206,27 +255,72 @@ async def top_command(interaction: discord.Interaction):
     
     players = response.get("players", [])
     
-    if not players:
-        await interaction.followup.send("Информация о балансах игроков недоступна.")
-        return
-    
     embed = discord.Embed(
         title="Топ игроков по балансу",
         color=discord.Color.gold()
     )
     
-    for i, player in enumerate(players, 1):
+    # Если есть предупреждение, добавляем его
+    if "warning" in response:
+        embed.add_field(name="⚠️ Предупреждение", value=response["warning"], inline=False)
+    
+    if not players:
+        embed.description = "Информация о балансах игроков недоступна."
+    else:
+        for i, player in enumerate(players, 1):
+            embed.add_field(
+                name=f"{i}. {player['name']}",
+                value=f"{player['balance']} монет",
+                inline=False
+            )
+    
+    await interaction.followup.send(embed=embed)
+
+# Простая команда для проверки статуса бота
+@tree.command(name="status", description="Проверить статус системы")
+async def status_command(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    embed = discord.Embed(
+        title="Статус системы",
+        color=discord.Color.blue()
+    )
+    
+    # Проверяем доступность API
+    api_available = await is_api_available()
+    
+    embed.add_field(
+        name="Discord бот", 
+        value="✅ Работает", 
+        inline=False
+    )
+    
+    embed.add_field(
+        name="API Minecraft", 
+        value="✅ Доступен" if api_available else "❌ Недоступен", 
+        inline=False
+    )
+    
+    if not api_available:
         embed.add_field(
-            name=f"{i}. {player['name']}",
-            value=f"{player['balance']} монет",
+            name="Режим работы", 
+            value="⚠️ Автономный режим (некоторые функции недоступны)", 
             inline=False
         )
     
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @client.event
 async def on_ready():
     print(f'Бот {client.user} запущен и готов к работе!')
+    print(f'API настроен на: {API_BASE_URL}')
+    
+    # Проверяем доступность API при запуске
+    api_available = await is_api_available()
+    if api_available:
+        print(f'API подключен успешно')
+    else:
+        print(f'API недоступен, работаем в автономном режиме')
     
     # Sync commands
     try:
